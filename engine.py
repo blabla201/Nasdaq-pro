@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-VERSION = "v4"
+VERSION = "v6"
 
 
 # ---------- Göstergeler ----------
@@ -93,13 +93,24 @@ def backtest(df, pos, cost=0.0005):
         aw=w.mean() if len(w) else 0.0, al=l.mean() if len(l) else 0.0,
         pf=(w.sum() / -l.sum()) if len(l) and l.sum() != 0 else (9.99 if len(w) else 0.0),
         sh=(sret.mean() / sd * np.sqrt(252)) if sd else 0.0,
-        rr=tot / abs(dd.min()) if dd.min() else 0.0, expo=p.mean(),
+        rr=tot / abs(dd.min()) if dd.min() else 0.0, expo=p.mean(), sret=sret,
     )
 
 def run_all(df, cost=0.0005):
     return {k: backtest(df, f(df), cost) for k, f in FUNCS.items()}
 
 # ---------- Skor ve işlem planı ----------
+def oos(res, frac=0.6):
+    """Veri dışı doğrulama: ilk %60'ta en iyi stratejiyi seç, hiç görmediği son %40'ta sına."""
+    def sh(x):
+        sd = x.std()
+        return float(x.mean() / sd * np.sqrt(252)) if sd else 0.0
+    n = len(next(iter(res.values()))["sret"]); cut = int(n * frac)
+    tr = {k: sh(r["sret"].iloc[:cut]) for k, r in res.items()}
+    k = max(tr, key=tr.get); r = res[k]; te = r["sret"].iloc[cut:]
+    return dict(k=k, train_sh=tr[k], test_sh=sh(te), test_tot=float((1 + te).prod() - 1),
+                test_bh=float(r["bh"].iloc[-1] / r["bh"].iloc[cut - 1] - 1))
+
 def score(df, best_sharpe):
     c, last = df.Close, df.iloc[-1]
     r, add = [], lambda t, p: r.append((t, p))
@@ -115,29 +126,34 @@ def score(df, best_sharpe):
     else: add(f"RSI {R:.0f}: nötr/zayıf", 0)
     vr = df.Volume.tail(5).mean() / df.Volume.tail(20).mean()
     add(f"Hacim ortalamanın {vr:.1f} katı", 10) if vr > 1.2 else add(f"Hacim normal ({vr:.1f}x)", 0)
-    add(f"Geçmişte en iyi strateji Sharpe {best_sharpe:.1f}", 10) if best_sharpe > .8 else add("Geçmiş strateji sonuçları zayıf", -5)
+    add(f"Veri dışı testte strateji Sharpe {best_sharpe:.1f}", 10) if best_sharpe > .8 else add("Veri dışı testte strateji zayıf", -5)
     return float(np.clip(50 + sum(p for _, p in r) / 1.5, 0, 100)), r
 
-def plan(df, sc):
+def plan(df, sc, mkt_ok=True, maxatr=1.0):
     last = df.iloc[-1]
     c, hh, a = last.Close, last.hh20, last.atr
     done, far = c > hh, c > hh * 1.03
     entry = (max(hh, last.e9) if far else c) if done else hh * 1.002
     stop = entry - 1.5 * a
     R = entry - stop
+    atrp = a / c
     warn = []
     if last.rsi > 75: warn.append("RSI aşırı alım bölgesinde")
     if c < last.vw: warn.append("Fiyat VWAP altında")
     if far: warn.append("Fiyat kırılımdan uzaklaştı: geri çekilmede girin, kovalamayın")
     if c < 5: warn.append("Düşük fiyatlı hisse: spread ve oynaklık riski yüksek, küçük pozisyon kullanın")
     if R / entry > .06: warn.append(f"Stop mesafesi geniş (%{R/entry*100:.1f})")
-    kind = "AL" if sc >= 70 and c > last.e21 else "IZLE" if sc >= 50 else "UZAK"
+    if atrp > maxatr: warn.append(f"Aşırı oynak: günlük ortalama hareket %{atrp*100:.1f}")
+    if not mkt_ok: warn.append("Piyasa filtresi: QQQ düşüş trendinde, yeni alım önerilmez")
+    blocked = atrp > maxatr or not mkt_ok
+    strong = sc >= 70 and c > last.e21
+    kind = "AL" if strong and not blocked else "IZLE" if sc >= 50 else "UZAK"
     if kind == "AL":
         label = ("GERİ ÇEKİLME BEKLE" if far else "ALIM BÖLGESİ") if done else f"KIRILIMI BEKLE (%{(hh/c-1)*100:.1f} uzakta)"
     else:
-        label = "İZLE" if kind == "IZLE" else "UZAK DUR"
+        label = ("İZLE (filtre)" if strong and blocked else "İZLE") if kind == "IZLE" else "UZAK DUR"
     return dict(price=c, hh=hh, entry=entry, stop=stop, R=R, t1=entry + 2 * R, t2=entry + 3 * R,
-                kind=kind, label=label, warn=warn, done=done)
+                kind=kind, label=label, warn=warn, done=done, atrp=atrp, max_days=10)
 
 def lots(capital, risk_pct, p, fractional=False):
     """Risk yüzdesine göre adet. fractional=True: parçalı (kesirli) hisse alınabilir."""

@@ -1,29 +1,28 @@
+import json
 import os
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from streamlit_autorefresh import st_autorefresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
 import engine
 import scanner
 from engine import NAMES, FUNCS, lots, session_vwap
 
-SURUM = "v4 (3 dosya)"
+SURUM = "v6 (3 dosya)"
 
 
 
 st.set_page_config("Nasdaq Strateji Laboratuvarı", page_icon="📈", layout="wide")
-st.markdown("""<style>
-.stApp{background:#0a1330;color:#e8edff}
-[data-testid=stSidebar]{background:#0d1838}
-[data-testid=stMetric]{background:#111d44;border:1px solid #223268;border-radius:12px;padding:10px}
-[data-testid=stExpander]{background:#111d44;border:1px solid #223268;border-radius:14px}
-button[data-baseweb=tab]{font-size:15px}
-.block-container{padding-top:1.2rem}
-</style>""", unsafe_allow_html=True)
+st.markdown("<style>.block-container{padding-top:1.2rem}</style>", unsafe_allow_html=True)
+_ph = st.empty()
+_ph.caption("⏳ Program yükleniyor…")
 
-if getattr(scanner, "VERSION", "") != "v4" or getattr(engine, "VERSION", "") != "v4":
+if getattr(scanner, "VERSION", "") != "v6" or getattr(engine, "VERSION", "") != "v6":
     st.error("GitHub'daki engine.py veya scanner.py eski sürümde. app.py, engine.py ve scanner.py dosyalarının üçünü de yeniden yükleyin.")
     st.stop()
 
@@ -44,8 +43,8 @@ def load_intra(sym):
     return d
 
 @st.cache_data(ttl=300, show_spinner="Hisseler taranıyor… (geniş taramada 1-3 dk sürebilir)")
-def scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac):
-    return scanner.run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
+def scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac, maxatr, use_mkt, use_earn):
+    return scanner.run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac, maxatr, use_mkt, use_earn)
 
 # ---------- Kenar çubuğu ----------
 with st.sidebar:
@@ -64,6 +63,9 @@ with st.sidebar:
     pmin = c1.number_input("Min. fiyat ($)", 0.5, 10_000.0, 3.0, 0.5)
     pmax = c2.number_input("Maks. fiyat ($)", 1.0, 100_000.0, 30.0, 1.0)
     frac = st.toggle("Parçalı (kesirli) hisse alabilirim", False)
+    maxatr = st.slider("Maks. günlük oynaklık (ATR %)", 2, 20, 8) / 100
+    use_mkt = st.toggle("Piyasa filtresi (QQQ düşüşteyse alım önerme)", True)
+    use_earn = st.toggle("Bilanço yakınsa uyar", True)
     with st.expander("🔔 Telegram uyarısı"):
         tok = st.text_input("Bot token", os.getenv("TELEGRAM_TOKEN", ""), type="password")
         chat = st.text_input("Chat ID", os.getenv("TELEGRAM_CHAT_ID", ""))
@@ -72,11 +74,10 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     st.caption("Veri: Yahoo Finance (yfinance), genelde ~15 dk gecikmeli. Telegram için @BotFather ile bot açıp token ve chat ID girin.")
-if auto:
-    st_autorefresh(interval=300_000, key="auto")
 
 st.title("📈 Nasdaq Strateji Laboratuvarı")
 st.caption("Sürüm: " + SURUM)
+_ph.empty()
 if not st.session_state.get("go"):
     st.info("Ayarlar sol üstteki **>>** menüsündedir (fiyat aralığı, sermaye, tarama türü). Hazırsanız taramayı başlatın.")
     if st.button("▶ Taramayı başlat", type="primary", use_container_width=True):
@@ -100,7 +101,7 @@ if mode == "Geniş Nasdaq taraması":
         st.stop()
     mode_eff, manual_eff = "Elle liste", " ".join(syms)
     info_pre = f"Nasdaq’ta {len(allsyms)} hisse bulundu, en likit {len(syms)} tanesi analiz edildi"
-A, NEW, INFO = scan(mode_eff, manual_eff, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
+A, NEW, INFO, MKT = scan(mode_eff, manual_eff, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac, maxatr, use_mkt, use_earn)
 if info_pre:
     INFO = info_pre
 if not A:
@@ -116,11 +117,12 @@ def layout(fig, h=380):
                       xaxis_rangeslider_visible=False)
     return fig
 
-t1, t2, t3, t4 = st.tabs(["Sinyal", "Strateji Lab", "Stratejiler", "Backtest & Performans"])
+t1, t2, t3, t4, t5 = st.tabs(["Sinyal", "Strateji Lab", "Stratejiler", "Backtest & Performans", "Günlük"])
 
 # ---------- 1) Sinyal ----------
 with t1:
     L = sorted(A.items(), key=lambda x: -x[1]["score"])
+    (st.success if MKT[0] else st.warning)("📊 Piyasa: " + MKT[1])
     if NEW:
         st.error("🔔 **YENİ SİNYAL:** " + ", ".join(n["sym"] for n in NEW))
         st.toast("Yeni sinyal: " + ", ".join(n["sym"] for n in NEW), icon="🔔")
@@ -142,6 +144,7 @@ with t1:
             q = lots(capital, risk, p, frac)
             st.caption(f"Hisse başı risk {f(p['R'])} (%{p['R']/p['entry']*100:.1f}) · Lot: **{q}** · "
                        f"Maks. kayıp ≈ ${q*p['R']:,.0f} · Pozisyon büyüklüğü ≈ ${q*p['entry']:,.0f}")
+            st.caption(f"⏱ Zaman stopu: {p['max_days']} işlem günü içinde hedefe gitmezse çıkın. Stop’u aşağı çekmeyin.")
             for w in p["warn"]:
                 st.warning(w, icon="⚠️")
             st.markdown("**Neden bu skor?**")
@@ -234,6 +237,10 @@ with t4:
         cc = st.columns(4)
         for j, (k, v) in enumerate(K[i:i + 4]):
             cc[j].metric(k, v)
+    o = A[sym4]["oos"]
+    st.info(f"**Veri dışı doğrulama:** ilk %60’lık dönemde en iyi çıkan strateji **{NAMES[o['k']]}** (Sharpe {o['train_sh']:.2f}). "
+            f"Hiç görmediği son %40’lık dönemde: getiri {pc(o['test_tot'])}, Sharpe {o['test_sh']:.2f}, al-tut {pc(o['test_bh'])}. "
+            "İki sonuç arasındaki fark, backtestin ne kadar iyimser olduğunu gösterir.")
     fd = go.Figure(go.Scatter(x=r["dd"].index, y=r["dd"], fill="tozeroy", line=dict(color="#ff5d73"), fillcolor="rgba(255,93,115,.2)"))
     st.subheader("Düşüş (drawdown)")
     st.plotly_chart(layout(fd, 220), use_container_width=True)
@@ -242,3 +249,53 @@ with t4:
     if len(tr):
         tr["Giriş"], tr["Çıkış"] = tr["Giriş"].dt.date, tr["Çıkış"].dt.date
     st.dataframe(tr.style.format({"Getiri": "{:+.2%}"}), hide_index=True, use_container_width=True)
+
+# ---------- 5) Günlük (sinyal sonuçları) ----------
+with t5:
+    LG = scanner.update_log(A)
+    done = [r for r in LG if r["durum"] in ("hedefe ulaştı", "stopa değdi", "süre doldu")]
+    wins = [r for r in done if r["sonuc"] is not None and r["sonuc"] > 0]
+    m = st.columns(4)
+    m[0].metric("Toplam kayıt", len(LG)); m[1].metric("Sonuçlanan", len(done))
+    m[2].metric("Kazanç oranı", f"{len(wins) / len(done):.0%}" if done else "—")
+    m[3].metric("Ort. sonuç", pc(sum(r["sonuc"] for r in done) / len(done), 2) if done else "—")
+    if len(done) < 30:
+        st.caption("Güvenilir bir başarı oranı için en az 30-50 sonuçlanmış sinyal gerekir. O zamana kadar bu rakamlara tek başına güvenmeyin.")
+    if LG:
+        T = pd.DataFrame(LG[::-1])
+        T["sonuc"] = T["sonuc"].map(lambda x: "" if x is None or x != x else f"{x:+.1%}")
+        cols = ["sym", "tarih", "kaynak", "durum", "entry", "stop", "t1", "giris_tarihi", "cikis_tarihi", "sonuc"]
+        T = T[cols].rename(columns={"sym": "Sembol", "tarih": "Sinyal tarihi", "kaynak": "Kaynak", "durum": "Durum", "entry": "Alış",
+                                    "stop": "Stop", "t1": "Hedef", "giris_tarihi": "Giriş", "cikis_tarihi": "Çıkış", "sonuc": "Sonuç"})
+        st.dataframe(T, hide_index=True, use_container_width=True)
+    else:
+        st.info("Henüz kayıt yok. Program yeni bir alım sinyali ürettiğinde burada otomatik görünür. Kendi aldığınız hisseyi aşağıdan elle ekleyebilirsiniz.")
+    st.caption("Durumlar: bekliyor = alış seviyesine henüz değmedi, açık = girildi, girilmedi = 5 günde alış seviyesine değmedi. "
+               "Aynı gün hem stop hem hedef görülürse stop sayılır (temkinli). Sonuçlar işlem maliyetini içerir.")
+    with st.expander("➕ Aldığım hisseyi elle kaydet"):
+        with st.form("manuel"):
+            ms = st.text_input("Sembol (örn. MAT)").upper().strip()
+            k1, k2, k3 = st.columns(3)
+            me = k1.number_input("Alış fiyatı", 0.0, 100000.0, 0.0, 0.01)
+            mst = k2.number_input("Stop", 0.0, 100000.0, 0.0, 0.01)
+            mt = k3.number_input("Hedef", 0.0, 100000.0, 0.0, 0.01)
+            md = st.date_input("Alış tarihi")
+            if st.form_submit_button("Kaydet"):
+                if ms and 0 < mst < me < mt:
+                    scanner.log_add(dict(sym=ms, tarih=str(md), kaynak="elle", etiket="elle", skor=None, entry=me, stop=mst, t1=mt,
+                                         max_days=10, durum="açık", giris_tarihi=str(md), cikis_tarihi=None, sonuc=None))
+                    st.success(ms + " kaydedildi.")
+                else:
+                    st.error("Sembol girin ve stop < alış < hedef olacak şekilde doldurun.")
+    st.download_button("⬇ Günlüğü indir (JSON)", json.dumps(LG, ensure_ascii=False, indent=1), "sinyal_gunlugu.json", "application/json")
+    up = st.file_uploader("Günlüğü geri yükle (JSON)", type="json")
+    if up is not None and st.button("Yükle ve birleştir"):
+        try:
+            scanner.merge_log(json.load(up))
+            st.rerun()
+        except Exception:
+            st.error("Dosya okunamadı.")
+    st.caption("⚠ Streamlit Cloud uygulama yeniden başladığında günlük silinebilir. Düzenli olarak indirin; Telegram mesajları da ayrı bir kayıt tutar.")
+
+if auto and st_autorefresh:
+    st_autorefresh(interval=300_000, key="auto")
