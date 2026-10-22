@@ -1,286 +1,16 @@
-import io, json, os, re, time, urllib.parse, urllib.request
-import numpy as np
+import os
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
 
-SURUM = "v3 (tek dosya)"
+import engine
+import scanner
+from engine import NAMES, FUNCS, lots, session_vwap
 
-# ===== MOTOR =====
+SURUM = "v4 (3 dosya)"
 
-# ---------- Göstergeler ----------
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
-
-def rsi(s, n=14):
-    d = s.diff()
-    au = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    ad = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return (100 - 100 / (1 + au / ad.replace(0, np.nan))).fillna(50)
-
-def atr(df, n=14):
-    pc = df.Close.shift()
-    tr = pd.concat([df.High - df.Low, (df.High - pc).abs(), (df.Low - pc).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-def vwap_roll(df, n=20):
-    tp = (df.High + df.Low + df.Close) / 3
-    return (tp * df.Volume).rolling(n).sum() / df.Volume.rolling(n).sum()
-
-def session_vwap(intra):
-    """Gün içi (5dk) veride her seansın kendi VWAP'ı."""
-    tp = (intra.High + intra.Low + intra.Close) / 3
-    day = intra.index.date
-    return (tp * intra.Volume).groupby(day).cumsum() / intra.Volume.groupby(day).cumsum()
-
-def prep(df):
-    df = df.copy()
-    c = df.Close
-    df["e9"], df["e21"] = ema(c, 9), ema(c, 21)
-    df["vw"], df["rsi"], df["atr"] = vwap_roll(df), rsi(c), atr(df)
-    df["hh20"] = df.High.shift(1).rolling(20).max()
-    df["ll10"] = df.Low.shift(1).rolling(10).min()
-    return df.dropna()
-
-# ---------- Stratejiler (sinyal: gün kapanışında 1=pozisyonda) ----------
-def _latch(enter, exit_):
-    out, p = [], 0
-    for e, x in zip(enter.values, exit_.values):
-        if p == 0 and e: p = 1
-        elif p == 1 and x: p = 0
-        out.append(p)
-    return pd.Series(out, index=enter.index, dtype=float)
-
-NAMES = {
-    "ema9": "EMA9 (fiyat > EMA9)",
-    "x921": "EMA9 / EMA21 kesişimi",
-    "vwap": "VWAP (20 gün) üstü",
-    "combo": "Birleşik: EMA9+VWAP+RSI",
-    "rsi": "RSI dönüş (35/55)",
-    "brk": "20 gün kırılım",
-}
-FUNCS = {
-    "ema9": lambda d: (d.Close > d.e9).astype(float),
-    "x921": lambda d: (d.e9 > d.e21).astype(float),
-    "vwap": lambda d: (d.Close > d.vw).astype(float),
-    "combo": lambda d: ((d.Close > d.e9) & (d.Close > d.vw) & (d.rsi > 50) & (d.rsi < 75)).astype(float),
-    "rsi": lambda d: _latch(d.rsi < 35, d.rsi > 55),
-    "brk": lambda d: _latch(d.Close > d.hh20, d.Close < d.ll10),
-}
-
-# ---------- Backtest ----------
-def backtest(df, pos, cost=0.0005):
-    """Sinyal t kapanışında oluşur, getiri t+1'den itibaren alınır (ileri bakış yok)."""
-    ret = df.Close.pct_change().fillna(0)
-    p = pos.shift(1).fillna(0)
-    turn = p.diff().abs().fillna(p.abs())
-    sret = p * ret - turn * cost
-    eq, bh = (1 + sret).cumprod(), (1 + ret).cumprod()
-    dd = eq / eq.cummax() - 1
-    chg = pos.diff().fillna(pos)
-    trades, entry = [], None
-    for t, v in chg.items():
-        if v == 1 and entry is None:
-            entry = t
-        elif v == -1 and entry is not None:
-            trades.append((entry, t, df.Close[t] / df.Close[entry] - 1 - 2 * cost)); entry = None
-    if entry is not None:
-        trades.append((entry, df.index[-1], df.Close.iloc[-1] / df.Close[entry] - 1 - 2 * cost))
-    tr = pd.DataFrame(trades, columns=["Giriş", "Çıkış", "Getiri"])
-    w, l = tr[tr.Getiri > 0].Getiri, tr[tr.Getiri <= 0].Getiri
-    sd = sret.std()
-    tot = eq.iloc[-1] - 1
-    return dict(
-        eq=eq, bh=bh, dd=dd, trades=tr, tot=tot, bhr=bh.iloc[-1] - 1, mdd=dd.min(),
-        n=len(tr), win=len(w) / len(tr) if len(tr) else 0,
-        aw=w.mean() if len(w) else 0.0, al=l.mean() if len(l) else 0.0,
-        pf=(w.sum() / -l.sum()) if len(l) and l.sum() != 0 else (9.99 if len(w) else 0.0),
-        sh=(sret.mean() / sd * np.sqrt(252)) if sd else 0.0,
-        rr=tot / abs(dd.min()) if dd.min() else 0.0, expo=p.mean(),
-    )
-
-def run_all(df, cost=0.0005):
-    return {k: backtest(df, f(df), cost) for k, f in FUNCS.items()}
-
-# ---------- Skor ve işlem planı ----------
-def score(df, best_sharpe):
-    c, last = df.Close, df.iloc[-1]
-    r, add = [], lambda t, p: r.append((t, p))
-    add("Fiyat EMA9 üzerinde", 15) if last.Close > last.e9 else add("Fiyat EMA9 altında", -10)
-    add("EMA9 > EMA21 (kısa trend yukarı)", 15) if last.e9 > last.e21 else add("EMA9 < EMA21 (trend zayıf)", -10)
-    add("Fiyat 20g VWAP üzerinde", 15) if last.Close > last.vw else add("Fiyat VWAP altında", -10)
-    r20 = c.iloc[-1] / c.iloc[-21] - 1
-    add(f"20 günlük getiri %{r20*100:+.1f}", 20 if r20 > .08 else 10 if r20 > 0 else -10)
-    R = last.rsi
-    if 50 <= R <= 70: add(f"RSI {R:.0f}: sağlıklı güç bölgesi", 15)
-    elif R > 75: add(f"RSI {R:.0f}: aşırı alım riski", -10)
-    elif R < 30: add(f"RSI {R:.0f}: aşırı satım, tepki olası", 5)
-    else: add(f"RSI {R:.0f}: nötr/zayıf", 0)
-    vr = df.Volume.tail(5).mean() / df.Volume.tail(20).mean()
-    add(f"Hacim ortalamanın {vr:.1f} katı", 10) if vr > 1.2 else add(f"Hacim normal ({vr:.1f}x)", 0)
-    add(f"Geçmişte en iyi strateji Sharpe {best_sharpe:.1f}", 10) if best_sharpe > .8 else add("Geçmiş strateji sonuçları zayıf", -5)
-    return float(np.clip(50 + sum(p for _, p in r) / 1.5, 0, 100)), r
-
-def plan(df, sc):
-    last = df.iloc[-1]
-    c, hh, a = last.Close, last.hh20, last.atr
-    done, far = c > hh, c > hh * 1.03
-    entry = (max(hh, last.e9) if far else c) if done else hh * 1.002
-    stop = entry - 1.5 * a
-    R = entry - stop
-    warn = []
-    if last.rsi > 75: warn.append("RSI aşırı alım bölgesinde")
-    if c < last.vw: warn.append("Fiyat VWAP altında")
-    if far: warn.append("Fiyat kırılımdan uzaklaştı: geri çekilmede girin, kovalamayın")
-    if c < 5: warn.append("Düşük fiyatlı hisse: spread ve oynaklık riski yüksek, küçük pozisyon kullanın")
-    if R / entry > .06: warn.append(f"Stop mesafesi geniş (%{R/entry*100:.1f})")
-    kind = "AL" if sc >= 70 and c > last.e21 else "IZLE" if sc >= 50 else "UZAK"
-    if kind == "AL":
-        label = ("GERİ ÇEKİLME BEKLE" if far else "ALIM BÖLGESİ") if done else f"KIRILIMI BEKLE (%{(hh/c-1)*100:.1f} uzakta)"
-    else:
-        label = "İZLE" if kind == "IZLE" else "UZAK DUR"
-    return dict(price=c, hh=hh, entry=entry, stop=stop, R=R, t1=entry + 2 * R, t2=entry + 3 * R,
-                kind=kind, label=label, warn=warn, done=done)
-
-def lots(capital, risk_pct, p, fractional=False):
-    """Risk yüzdesine göre adet. fractional=True: parçalı (kesirli) hisse alınabilir."""
-    if p["R"] <= 0:
-        return 0
-    q = min(capital * risk_pct / 100 / p["R"], capital / p["entry"])
-    return round(q, 2) if fractional else int(q)
-
-# ===== TARAYICI =====
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-STATE = os.path.join(HERE, "alerts_state.json")
-LIQ = os.path.join(HERE, "liquid_cache.json")
-NDX_FALLBACK = ("AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO COST NFLX AMD ADBE PEP CSCO TMUS INTC QCOM TXN AMGN INTU "
-                "AMAT BKNG ISRG LRCX MU PANW ADI KLAC SBUX GILD MRVL CRWD ABNB ADP CDNS SNPS ORLY MELI PYPL").split()
-
-# ---------- Evren ----------
-def universe_ndx():
-    try:
-        t = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100", match="Ticker")[0]
-        return [s.replace(".", "-") for s in t["Ticker"].astype(str)]
-    except Exception:
-        return NDX_FALLBACK
-
-def universe_all():
-    """Nasdaq'ın resmi sembol listesi: test/ETF/varant/hak/imtiyazlı hisseler elenir."""
-    raw = urllib.request.urlopen("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", timeout=25).read().decode()
-    d = pd.read_csv(io.StringIO(raw), sep="|")
-    d = d[d["Symbol"].astype(str).str.match(r"^[A-Z]{1,5}$") & (d["Test Issue"] == "N") & (d["ETF"] == "N")]
-    d = d[~d["Security Name"].str.contains(r"Warrant|Right|Unit|Preferred|Notes|Depositary", case=False, regex=True)]
-    return d["Symbol"].tolist()
-
-# ---------- Veri ----------
-def load_daily(tickers, period="2y", chunk=100, minlen=150):
-    out, tickers = {}, list(tickers)
-    for i in range(0, len(tickers), chunk):
-        part = tickers[i:i + chunk]
-        try:
-            raw = yf.download(part, period=period, interval="1d", group_by="ticker",
-                              auto_adjust=True, threads=True, progress=False)
-        except Exception:
-            continue
-        for t in part:
-            try:
-                d = raw[t] if isinstance(raw.columns, pd.MultiIndex) and t in raw.columns.get_level_values(0) else raw
-                d = d.copy()
-                if isinstance(d.columns, pd.MultiIndex):
-                    d.columns = d.columns.get_level_values(0)
-                d = d[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                if len(d) >= minlen:
-                    out[t] = d
-            except Exception:
-                pass
-    return out
-
-def liquid(symbols, topn, minvol, pmin=5, pmax=1e9):
-    """Fiyatı pmin-pmax arasında ve 50 günlük ortalama $ hacmi yeterli olan en likit hisseler (12 saat önbellek)."""
-    key = f"{len(symbols)}-{topn}-{int(minvol)}-{pmin}-{pmax}"
-    try:
-        c = json.load(open(LIQ))
-        if c["key"] == key and time.time() - c["t"] < 12 * 3600:
-            return c["syms"]
-    except Exception:
-        pass
-    rows = []
-    for s, d in load_daily(symbols, "3mo", 200, 30).items():
-        dv = (d.Close * d.Volume).tail(50).mean()
-        if pmin <= d.Close.iloc[-1] <= pmax and dv >= minvol:
-            rows.append((s, dv))
-    syms = [s for s, _ in sorted(rows, key=lambda x: -x[1])[:topn]]
-    try:
-        json.dump(dict(key=key, t=time.time(), syms=syms), open(LIQ, "w"))
-    except Exception:
-        pass
-    return syms
-
-# ---------- Uyarılar ----------
-def sig_type(p):
-    return "kirilim" if not p["done"] else "geri" if "GERİ" in p["label"] else "alim"
-
-def fmt(sym, a, capital, risk, frac=False):
-    p = a["plan"]
-    q = lots(capital, risk, p, frac)
-    w = (" ⚠ " + "; ".join(p["warn"])) if p["warn"] else ""
-    return (f"🟢 {sym} — {p['label']}\nSkor {a['score']:.0f} · Fiyat ${p['price']:.2f}\n"
-            f"Kırılım ${p['hh']:.2f} · Alış ${p['entry']:.2f} · Stop ${p['stop']:.2f}\n"
-            f"Hedef ${p['t1']:.2f} / ${p['t2']:.2f} · Lot {q}{w}\nYatırım tavsiyesi değildir.")
-
-def detect_new(A, capital, risk, frac=False):
-    cur = {f"{s}:{sig_type(a['plan'])}": s for s, a in A.items() if a["plan"]["kind"] == "AL"}
-    try:
-        old = set(json.load(open(STATE)))
-    except Exception:
-        old = set()
-    try:
-        json.dump(sorted(cur), open(STATE, "w"))
-    except Exception:
-        pass
-    return [dict(sym=s, msg=fmt(s, A[s], capital, risk, frac)) for k, s in cur.items() if k not in old]
-
-def telegram(token, chat, text):
-    try:
-        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=15)
-        return True
-    except Exception:
-        return False
-
-# ---------- Ana tarama ----------
-def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", pmin=0, pmax=1e9, frac=False):
-    if mode.startswith("Nasdaq-100"):
-        syms, info = universe_ndx(), "Nasdaq-100 hisseleri tarandı"
-    elif mode.startswith("Geniş"):
-        allsyms = universe_all()
-        syms = liquid(allsyms, topn, minvol, pmin, pmax)
-        info = f"Nasdaq’ta {len(allsyms)} hisse bulundu, en likit {len(syms)} tanesi analiz edildi"
-    else:
-        syms, info = re.findall(r"[A-Za-z.\-]+", manual.upper()), "Elle girilen liste"
-    A = {}
-    for t, raw in load_daily(dict.fromkeys(syms)).items():
-        try:
-            if not pmin <= raw.Close.iloc[-1] <= pmax:
-                continue
-            df = prep(raw)
-            if len(df) < 100:
-                continue
-            bt = run_all(df, cost)
-            sc, why = score(df, max(r["sh"] for r in bt.values()))
-            A[t] = dict(df=df, bt=bt, score=sc, why=why, plan=plan(df, sc))
-        except Exception:
-            continue
-    new = detect_new(A, capital, risk, frac) if A else []
-    if tok and chat:
-        for n in new:
-            telegram(tok, chat, n["msg"])
-    return A, new, info
-
-# ===== ARAYÜZ =====
 
 
 st.set_page_config("Nasdaq Strateji Laboratuvarı", page_icon="📈", layout="wide")
@@ -292,6 +22,10 @@ st.markdown("""<style>
 button[data-baseweb=tab]{font-size:15px}
 .block-container{padding-top:1.2rem}
 </style>""", unsafe_allow_html=True)
+
+if getattr(scanner, "VERSION", "") != "v4" or getattr(engine, "VERSION", "") != "v4":
+    st.error("GitHub'daki engine.py veya scanner.py eski sürümde. app.py, engine.py ve scanner.py dosyalarının üçünü de yeniden yükleyin.")
+    st.stop()
 
 DEFAULT = ("AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO COST NFLX AMD ADBE PEP CSCO TMUS INTC "
            "QCOM TXN AMGN INTU AMAT BKNG ISRG LRCX MU PANW ADI KLAC SBUX GILD")
@@ -311,7 +45,7 @@ def load_intra(sym):
 
 @st.cache_data(ttl=300, show_spinner="Hisseler taranıyor… (geniş taramada 1-3 dk sürebilir)")
 def scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac):
-    return run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
+    return scanner.run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
 
 # ---------- Kenar çubuğu ----------
 with st.sidebar:
@@ -341,7 +75,34 @@ with st.sidebar:
 if auto:
     st_autorefresh(interval=300_000, key="auto")
 
-A, NEW, INFO = scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
+st.title("📈 Nasdaq Strateji Laboratuvarı")
+st.caption("Sürüm: " + SURUM)
+if not st.session_state.get("go"):
+    st.info("Ayarlar sol üstteki **>>** menüsündedir (fiyat aralığı, sermaye, tarama türü). Hazırsanız taramayı başlatın.")
+    if st.button("▶ Taramayı başlat", type="primary", use_container_width=True):
+        st.session_state["go"] = True
+        st.rerun()
+    st.stop()
+mode_eff, manual_eff, info_pre = mode, manual, ""
+if mode == "Geniş Nasdaq taraması":
+    bar = st.progress(0.0, text="Nasdaq hisseleri taranıyor… (ilk seferde birkaç dakika sürebilir)")
+    try:
+        allsyms = scanner.universe_all()
+        syms = scanner.liquid(allsyms, topn, minvol, pmin, pmax,
+                      progress=lambda x: bar.progress(min(x, 1.0), text=f"Nasdaq hisseleri taranıyor… %{int(x * 100)}"))
+    except Exception as e:
+        bar.empty()
+        st.error("Nasdaq hisse listesi alınamadı: " + str(e)[:150] + ". Birkaç dakika sonra yeniden deneyin ya da sol menüden Nasdaq-100’ü seçin.")
+        st.stop()
+    bar.empty()
+    if not syms:
+        st.error("Bu fiyat ve hacim şartlarına uyan hisse bulunamadı. Fiyat aralığını genişletin ya da hacim şartını düşürün.")
+        st.stop()
+    mode_eff, manual_eff = "Elle liste", " ".join(syms)
+    info_pre = f"Nasdaq’ta {len(allsyms)} hisse bulundu, en likit {len(syms)} tanesi analiz edildi"
+A, NEW, INFO = scan(mode_eff, manual_eff, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
+if info_pre:
+    INFO = info_pre
 if not A:
     st.error("Bu fiyat aralığında analiz edilecek hisse bulunamadı. Fiyat aralığını genişletin, hacim şartını düşürün ya da internet bağlantısını kontrol edin.")
     st.stop()
@@ -355,8 +116,6 @@ def layout(fig, h=380):
                       xaxis_rangeslider_visible=False)
     return fig
 
-st.title("📈 Nasdaq Strateji Laboratuvarı")
-st.caption("Sürüm: " + SURUM)
 t1, t2, t3, t4 = st.tabs(["Sinyal", "Strateji Lab", "Stratejiler", "Backtest & Performans"])
 
 # ---------- 1) Sinyal ----------

@@ -2,6 +2,9 @@
 import numpy as np
 import pandas as pd
 
+VERSION = "v4"
+
+
 # ---------- Göstergeler ----------
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
@@ -142,3 +145,4 @@ def lots(capital, risk_pct, p, fractional=False):
         return 0
     q = min(capital * risk_pct / 100 / p["R"], capital / p["entry"])
     return round(q, 2) if fractional else int(q)
+

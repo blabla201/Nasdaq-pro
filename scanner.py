@@ -4,6 +4,9 @@ import pandas as pd
 import yfinance as yf
 from engine import lots, plan, prep, run_all, score
 
+VERSION = "v4"
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "alerts_state.json")
 LIQ = os.path.join(HERE, "liquid_cache.json")
@@ -27,7 +30,7 @@ def universe_all():
     return d["Symbol"].tolist()
 
 # ---------- Veri ----------
-def load_daily(tickers, period="2y", chunk=100, minlen=150):
+def load_daily(tickers, period="2y", chunk=100, minlen=150, progress=None):
     out, tickers = {}, list(tickers)
     for i in range(0, len(tickers), chunk):
         part = tickers[i:i + chunk]
@@ -36,6 +39,8 @@ def load_daily(tickers, period="2y", chunk=100, minlen=150):
                               auto_adjust=True, threads=True, progress=False)
         except Exception:
             continue
+        if progress:
+            progress(min(1.0, (i + chunk) / max(1, len(tickers))))
         for t in part:
             try:
                 d = raw[t] if isinstance(raw.columns, pd.MultiIndex) and t in raw.columns.get_level_values(0) else raw
@@ -49,7 +54,7 @@ def load_daily(tickers, period="2y", chunk=100, minlen=150):
                 pass
     return out
 
-def liquid(symbols, topn, minvol, pmin=5, pmax=1e9):
+def liquid(symbols, topn, minvol, pmin=5, pmax=1e9, progress=None):
     """Fiyatı pmin-pmax arasında ve 50 günlük ortalama $ hacmi yeterli olan en likit hisseler (12 saat önbellek)."""
     key = f"{len(symbols)}-{topn}-{int(minvol)}-{pmin}-{pmax}"
     try:
@@ -59,8 +64,8 @@ def liquid(symbols, topn, minvol, pmin=5, pmax=1e9):
     except Exception:
         pass
     rows = []
-    for s, d in load_daily(symbols, "3mo", 200, 30).items():
-        dv = (d.Close * d.Volume).tail(50).mean()
+    for s, d in load_daily(symbols, "1mo", 300, 15, progress).items():
+        dv = (d.Close * d.Volume).tail(20).mean()
         if pmin <= d.Close.iloc[-1] <= pmax and dv >= minvol:
             rows.append((s, dv))
     syms = [s for s, _ in sorted(rows, key=lambda x: -x[1])[:topn]]
@@ -130,3 +135,4 @@ def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", p
         for n in new:
             telegram(tok, chat, n["msg"])
     return A, new, info
+
