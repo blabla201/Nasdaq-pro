@@ -49,9 +49,9 @@ def load_daily(tickers, period="2y", chunk=100, minlen=150):
                 pass
     return out
 
-def liquid(symbols, topn, minvol):
-    """Fiyatı >= 5$ ve 50 günlük ortalama $ hacmi yeterli olan en likit hisseler (12 saat önbellek)."""
-    key = f"{len(symbols)}-{topn}-{int(minvol)}"
+def liquid(symbols, topn, minvol, pmin=5, pmax=1e9):
+    """Fiyatı pmin-pmax arasında ve 50 günlük ortalama $ hacmi yeterli olan en likit hisseler (12 saat önbellek)."""
+    key = f"{len(symbols)}-{topn}-{int(minvol)}-{pmin}-{pmax}"
     try:
         c = json.load(open(LIQ))
         if c["key"] == key and time.time() - c["t"] < 12 * 3600:
@@ -61,7 +61,7 @@ def liquid(symbols, topn, minvol):
     rows = []
     for s, d in load_daily(symbols, "3mo", 200, 30).items():
         dv = (d.Close * d.Volume).tail(50).mean()
-        if d.Close.iloc[-1] >= 5 and dv >= minvol:
+        if pmin <= d.Close.iloc[-1] <= pmax and dv >= minvol:
             rows.append((s, dv))
     syms = [s for s, _ in sorted(rows, key=lambda x: -x[1])[:topn]]
     try:
@@ -74,15 +74,15 @@ def liquid(symbols, topn, minvol):
 def sig_type(p):
     return "kirilim" if not p["done"] else "geri" if "GERİ" in p["label"] else "alim"
 
-def fmt(sym, a, capital, risk):
+def fmt(sym, a, capital, risk, frac=False):
     p = a["plan"]
-    q = lots(capital, risk, p)
+    q = lots(capital, risk, p, frac)
     w = (" ⚠ " + "; ".join(p["warn"])) if p["warn"] else ""
     return (f"🟢 {sym} — {p['label']}\nSkor {a['score']:.0f} · Fiyat ${p['price']:.2f}\n"
             f"Kırılım ${p['hh']:.2f} · Alış ${p['entry']:.2f} · Stop ${p['stop']:.2f}\n"
             f"Hedef ${p['t1']:.2f} / ${p['t2']:.2f} · Lot {q}{w}\nYatırım tavsiyesi değildir.")
 
-def detect_new(A, capital, risk):
+def detect_new(A, capital, risk, frac=False):
     cur = {f"{s}:{sig_type(a['plan'])}": s for s, a in A.items() if a["plan"]["kind"] == "AL"}
     try:
         old = set(json.load(open(STATE)))
@@ -92,7 +92,7 @@ def detect_new(A, capital, risk):
         json.dump(sorted(cur), open(STATE, "w"))
     except Exception:
         pass
-    return [dict(sym=s, msg=fmt(s, A[s], capital, risk)) for k, s in cur.items() if k not in old]
+    return [dict(sym=s, msg=fmt(s, A[s], capital, risk, frac)) for k, s in cur.items() if k not in old]
 
 def telegram(token, chat, text):
     try:
@@ -103,18 +103,20 @@ def telegram(token, chat, text):
         return False
 
 # ---------- Ana tarama ----------
-def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat=""):
+def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", pmin=0, pmax=1e9, frac=False):
     if mode.startswith("Nasdaq-100"):
         syms, info = universe_ndx(), "Nasdaq-100 hisseleri tarandı"
     elif mode.startswith("Geniş"):
         allsyms = universe_all()
-        syms = liquid(allsyms, topn, minvol)
+        syms = liquid(allsyms, topn, minvol, pmin, pmax)
         info = f"Nasdaq’ta {len(allsyms)} hisse bulundu, en likit {len(syms)} tanesi analiz edildi"
     else:
         syms, info = re.findall(r"[A-Za-z.\-]+", manual.upper()), "Elle girilen liste"
     A = {}
     for t, raw in load_daily(dict.fromkeys(syms)).items():
         try:
+            if not pmin <= raw.Close.iloc[-1] <= pmax:
+                continue
             df = prep(raw)
             if len(df) < 100:
                 continue
@@ -123,7 +125,7 @@ def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat=""):
             A[t] = dict(df=df, bt=bt, score=sc, why=why, plan=plan(df, sc))
         except Exception:
             continue
-    new = detect_new(A, capital, risk) if A else []
+    new = detect_new(A, capital, risk, frac) if A else []
     if tok and chat:
         for n in new:
             telegram(tok, chat, n["msg"])

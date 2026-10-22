@@ -126,6 +126,7 @@ def plan(df, sc):
     if last.rsi > 75: warn.append("RSI aşırı alım bölgesinde")
     if c < last.vw: warn.append("Fiyat VWAP altında")
     if far: warn.append("Fiyat kırılımdan uzaklaştı: geri çekilmede girin, kovalamayın")
+    if c < 5: warn.append("Düşük fiyatlı hisse: spread ve oynaklık riski yüksek, küçük pozisyon kullanın")
     if R / entry > .06: warn.append(f"Stop mesafesi geniş (%{R/entry*100:.1f})")
     kind = "AL" if sc >= 70 and c > last.e21 else "IZLE" if sc >= 50 else "UZAK"
     if kind == "AL":
@@ -135,6 +136,9 @@ def plan(df, sc):
     return dict(price=c, hh=hh, entry=entry, stop=stop, R=R, t1=entry + 2 * R, t2=entry + 3 * R,
                 kind=kind, label=label, warn=warn, done=done)
 
-def lots(capital, risk_pct, p):
-    q = int(capital * risk_pct / 100 // p["R"]) if p["R"] > 0 else 0
-    return min(q, int(capital // p["entry"]))
+def lots(capital, risk_pct, p, fractional=False):
+    """Risk yüzdesine göre adet. fractional=True: parçalı (kesirli) hisse alınabilir."""
+    if p["R"] <= 0:
+        return 0
+    q = min(capital * risk_pct / 100 / p["R"], capital / p["entry"])
+    return round(q, 2) if fractional else int(q)

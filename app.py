@@ -35,22 +35,26 @@ def load_intra(sym):
     return d
 
 @st.cache_data(ttl=300, show_spinner="Hisseler taranıyor… (geniş taramada 1-3 dk sürebilir)")
-def scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat):
-    return scanner.run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat)
+def scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac):
+    return scanner.run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
 
 # ---------- Kenar çubuğu ----------
 with st.sidebar:
     st.header("Ayarlar")
-    mode = st.radio("Hisseleri nasıl bulsun?", ["Nasdaq-100 (hızlı)", "Geniş Nasdaq taraması", "Elle liste"])
+    mode = st.radio("Hisseleri nasıl bulsun?", ["Nasdaq-100 (hızlı)", "Geniş Nasdaq taraması", "Elle liste"], index=1)
     topn, minvol, manual = 0, 0, ""
     if mode == "Geniş Nasdaq taraması":
         topn = st.slider("Analiz edilecek en likit hisse sayısı", 30, 300, 120, 10)
-        minvol = st.number_input("Min. günlük işlem hacmi (milyon $)", 5, 1000, 50, 5) * 1e6
+        minvol = st.number_input("Min. günlük işlem hacmi (milyon $)", 1, 1000, 10, 1) * 1e6
     elif mode == "Elle liste":
         manual = st.text_area("Hisseler (boşlukla ayır)", DEFAULT, height=100)
-    capital = st.number_input("Sermaye ($)", 100, 10_000_000, 10_000, 500)
+    capital = st.number_input("Sermaye ($)", 10, 10_000_000, 100, 10)
     risk = st.number_input("İşlem başı risk (%)", 0.1, 10.0, 1.0, 0.1)
     cost = st.number_input("İşlem maliyeti (her yön, %)", 0.0, 1.0, 0.05, 0.01) / 100
+    c1, c2 = st.columns(2)
+    pmin = c1.number_input("Min. fiyat ($)", 0.5, 10_000.0, 3.0, 0.5)
+    pmax = c2.number_input("Maks. fiyat ($)", 1.0, 100_000.0, 30.0, 1.0)
+    frac = st.toggle("Parçalı (kesirli) hisse alabilirim", False)
     with st.expander("🔔 Telegram uyarısı"):
         tok = st.text_input("Bot token", os.getenv("TELEGRAM_TOKEN", ""), type="password")
         chat = st.text_input("Chat ID", os.getenv("TELEGRAM_CHAT_ID", ""))
@@ -62,9 +66,9 @@ with st.sidebar:
 if auto:
     st_autorefresh(interval=300_000, key="auto")
 
-A, NEW, INFO = scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat)
+A, NEW, INFO = scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac)
 if not A:
-    st.error("Veri alınamadı. İnternet bağlantısını kontrol edin.")
+    st.error("Bu fiyat aralığında analiz edilecek hisse bulunamadı. Fiyat aralığını genişletin, hacim şartını düşürün ya da internet bağlantısını kontrol edin.")
     st.stop()
 st.caption(f"🔎 {INFO} · {len(A)} hisse analiz edildi")
 
@@ -100,7 +104,7 @@ with t1:
             c[1].metric("Alış noktası", f(p["entry"]))
             c[2].metric("Stop noktası", f(p["stop"]), pc(p["stop"] / p["entry"] - 1))
             c[3].metric("Hedef 2R / 3R", f(p["t1"]), f(p["t2"]), delta_color="off")
-            q = lots(capital, risk, p)
+            q = lots(capital, risk, p, frac)
             st.caption(f"Hisse başı risk {f(p['R'])} (%{p['R']/p['entry']*100:.1f}) · Lot: **{q}** · "
                        f"Maks. kayıp ≈ ${q*p['R']:,.0f} · Pozisyon büyüklüğü ≈ ${q*p['entry']:,.0f}")
             for w in p["warn"]:
