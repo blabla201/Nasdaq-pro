@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -13,7 +14,7 @@ import engine
 import scanner
 from engine import NAMES, FUNCS, lots, session_vwap
 
-SURUM = "v7 (3 dosya)"
+SURUM = "v10 (3 dosya)"
 
 
 
@@ -22,7 +23,7 @@ st.markdown("<style>.block-container{padding-top:1.2rem}</style>", unsafe_allow_
 _ph = st.empty()
 _ph.caption("⏳ Program yükleniyor…")
 
-if getattr(scanner, "VERSION", "") != "v7" or getattr(engine, "VERSION", "") != "v7":
+if getattr(scanner, "VERSION", "") != "v10" or getattr(engine, "VERSION", "") != "v10":
     st.error("GitHub'daki engine.py veya scanner.py eski sürümde. app.py, engine.py ve scanner.py dosyalarının üçünü de yeniden yükleyin.")
     st.stop()
 
@@ -46,6 +47,10 @@ def load_intra(sym):
 def scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac, maxatr, use_mkt, use_earn):
     return scanner.run_scan(mode, manual, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac, maxatr, use_mkt, use_earn)
 
+@st.cache_data(ttl=300, show_spinner="Hisse inceleniyor…")
+def inspect(sym):
+    return scanner.inspect_symbol(sym)
+
 # ---------- Kenar çubuğu ----------
 with st.sidebar:
     st.header("Ayarlar")
@@ -66,6 +71,8 @@ with st.sidebar:
     maxatr = st.slider("Maks. günlük oynaklık (ATR %)", 2, 20, 8) / 100
     use_mkt = st.toggle("Piyasa filtresi (QQQ düşüşteyse alım önerme)", True)
     use_earn = st.toggle("Bilanço yakınsa uyar", True)
+    vade = st.selectbox("Ani sıçrama stratejisi vadesi", ["1 gün (alıp ertesi gün çık)", "1-3 gün", "Hepsi (en iyisini bul)"], index=0)
+    days_allowed = {"1 gün (alıp ertesi gün çık)": (1,), "1-3 gün": (1, 2, 3)}.get(vade, (1, 2, 3, 5))
     with st.expander("🔔 Telegram uyarısı"):
         tok = st.text_input("Bot token", os.getenv("TELEGRAM_TOKEN", ""), type="password")
         chat = st.text_input("Chat ID", os.getenv("TELEGRAM_CHAT_ID", ""))
@@ -84,6 +91,7 @@ if not st.session_state.get("go"):
         st.session_state["go"] = True
         st.rerun()
     st.stop()
+SG = None
 mode_eff, manual_eff, info_pre = mode, manual, ""
 if mode == "Geniş Nasdaq taraması":
     bar = st.progress(0.0, text="Nasdaq hisseleri taranıyor… (ilk seferde birkaç dakika sürebilir)")
@@ -99,6 +107,14 @@ if mode == "Geniş Nasdaq taraması":
     if not syms:
         st.error("Bu fiyat ve hacim şartlarına uyan hisse bulunamadı. Fiyat aralığını genişletin ya da hacim şartını düşürün.")
         st.stop()
+    sbar = st.progress(0.0, text="Ani sıçrama adayları ve geçmiş sonuçları taranıyor…")
+    try:
+        SG = scanner.run_surge(scanner.liquid(allsyms, 400, 1e6, 1.0, pmax), pmax, days_allowed,
+                               lambda x: sbar.progress(min(x, 1.0), text=f"Ani sıçrama analizi… %{int(x * 100)}"))
+        scanner.surge_alerts(SG, tok, chat, capital, risk, frac)
+    except Exception:
+        SG = None
+    sbar.empty()
     mode_eff, manual_eff = "Elle liste", " ".join(syms)
     info_pre = f"Nasdaq’ta {len(allsyms)} hisse bulundu, en likit {len(syms)} tanesi analiz edildi"
 A, NEW, INFO, MKT = scan(mode_eff, manual_eff, topn, minvol, cost, capital, risk, tok, chat, pmin, pmax, frac, maxatr, use_mkt, use_earn)
@@ -117,12 +133,54 @@ def layout(fig, h=380):
                       xaxis_rangeslider_visible=False)
     return fig
 
-t1, t2, t3, t4, t5 = st.tabs(["Sinyal", "Strateji Lab", "Stratejiler", "Backtest & Performans", "Günlük"])
+t1, t2, t3, t4, t5, t6 = st.tabs(["Sinyal", "Strateji Lab", "Stratejiler", "Backtest & Performans", "Günlük", "Radar"])
 
 # ---------- 1) Sinyal ----------
 with t1:
     L = sorted(A.items(), key=lambda x: -x[1]["score"])
     (st.success if MKT[0] else st.warning)("📊 Piyasa: " + MKT[1])
+    st.subheader("🎯 Bugünün önerisi")
+    picks = []
+    if SG and SG["ok"]:
+        picks += [("surge", r) for r in SG["rows"][:3]]
+    picks += [("main", (s, a_)) for s, a_ in L if a_["plan"]["kind"] == "AL"][:max(0, 3 - len(picks))]
+    for kind_, obj in picks:
+        with st.container(border=True):
+            if kind_ == "surge":
+                Sg = SG["stats"]
+                lv = scanner.surge_levels(obj["price"], Sg["stop"])
+                q_ = lots(capital, risk, dict(R=lv["R"], entry=lv["entry"]), frac)
+                st.markdown(f"### 🚀 {obj['sym']} · {f(obj['price'])} · bugün {pc(obj['change'], 0)} · hacim {obj['volx']:.0f}x")
+                k_ = st.columns(3)
+                k_[0].metric("Alış (yarın açılışta)", f"≤ {f(lv['limit'])}")
+                k_[1].metric(f"Stop (−%{Sg['stop'] * 100:.0f})", f(lv["stop"])); k_[2].metric(f"Hedef (+%{Sg['tgt'] * 100:.0f})", f(lv["t1"]))
+                cik_ = "Yarın kapanışta mutlaka çıkın." if Sg["days"] == 1 else f"{Sg['days']} işlem günü içinde hedefe gitmezse çıkın."
+                st.caption(f"Lot: {q_} · {cik_} Açılış bugünkü kapanışın %3’ünden fazla üstündeyse almayın. "
+                           f"Geçmiş {Sg['n']} benzer olayda kazanç %{Sg['win'] * 100:.0f}, ortalama {pc(Sg['exp'])}.")
+            else:
+                s_, a2 = obj; p_ = a2["plan"]
+                st.markdown(f"### 🟢 {s_} · {f(p_['price'])} · {p_['label']}")
+                k_ = st.columns(3)
+                k_[0].metric("Alış", f(p_["entry"])); k_[1].metric("Stop", f(p_["stop"])); k_[2].metric("Hedef", f(p_["t1"]))
+                st.caption(f"Skor {a2['score']:.0f} · Lot: {lots(capital, risk, p_, frac)} · {p_['max_days']} işlem günü içinde hedefe gitmezse çıkın.")
+    if not picks:
+        st.info("Bugün alınacak güçlü aday yok. Beklemek de bir karardır; program yeni aday bulunca uyarır.")
+    st.caption(f"🛑 Günlük zarar limiti: {f(capital * 0.05)} (sermayenin %5’i). Ulaşırsanız o gün işlemi bırakın; kaybı kovalamak sermayeyi en hızlı eriten şeydir.")
+    if SG:
+        S_ = SG["stats"]
+        with st.expander("📊 Ani sıçrama yapan hisselerde geçmiş 1 yılın sonucu"):
+            if SG["cfgs"]:
+                st.markdown(f"**En iyi ayar:** {S_['days']} gün · stop %{S_['stop'] * 100:.0f} · hedef %{S_['tgt'] * 100:.0f} → "
+                            f"**{S_['n']} olay**, kazanç **%{S_['win'] * 100:.0f}**, ortalama **{pc(S_['exp'])}**, son dönem (doğrulama) {pc(S_['test_exp'])}")
+                st.write("✅ Hem seçim döneminde hem hiç görmediği doğrulama döneminde olumlu: program bu tür adayları öneriyor." if SG["ok"] else
+                         "⛔ Hiçbir ayar hem seçim hem doğrulama döneminde olumlu çıkmadı: program ani sıçrama hisselerine girmenizi **önermiyor**.")
+                T_ = pd.DataFrame([{"Vade (gün)": c["days"], "Stop": f"%{c['stop'] * 100:.0f}", "Hedef": f"%{c['tgt'] * 100:.0f}", "Olay": c["n"],
+                                    "Kazanç": f"%{c['win'] * 100:.0f}", "Ortalama": pc(c["exp"]), "Doğrulama": pc(c["test_exp"]),
+                                    "Geçerli": "✅" if c["ok"] else "—"} for c in SG["cfgs"]])
+                st.dataframe(T_, hide_index=True, use_container_width=True)
+            st.caption("Kural: %8-60 yükseliş, hacim ≥3x, günü zirveye yakın kapanış, 20 günlük zirve kırılımı. Ertesi gün açılıştan giriş (açılış %3'ten fazla yukarıdaysa girilmez), "
+                       "hedef = 2×stop, %1 maliyet ve kayma dahil. Aynı gün stop ve hedef görülürse stop sayılır. "
+                       "Uyarı: yalnızca bugün listede olan hisseler incelendi, borsadan çıkarılmış hisseler yok; gerçek sonuç bundan daha kötü olabilir.")
     if NEW:
         st.error("🔔 **YENİ SİNYAL:** " + ", ".join(n["sym"] for n in NEW))
         st.toast("Yeni sinyal: " + ", ".join(n["sym"] for n in NEW), icon="🔔")
@@ -308,6 +366,63 @@ with t5:
         except Exception:
             st.error("Dosya okunamadı.")
     st.caption("⚠ Streamlit Cloud uygulama yeniden başladığında günlük silinebilir. Düzenli olarak indirin; Telegram mesajları da ayrı bir kayıt tutar.")
+
+# ---------- 6) Radar ----------
+with t6:
+    st.subheader("🔎 Hisse incele")
+    q = st.text_input("Sembol yazın (örn. RETO, CLRO)", "").upper().strip()
+    if q:
+        X = inspect(q)
+        if not X:
+            st.error(f"{q} için veri bulunamadı. Sembolü kontrol edin.")
+        else:
+            m = st.columns(4)
+            m[0].metric("Fiyat", f(X["price"])); m[1].metric("Bugün", pc(X["ch1"]))
+            m[2].metric("5 gün", pc(X["ch5"])); m[3].metric("20 gün", pc(X["ch20"]))
+            m = st.columns(4)
+            m[0].metric("Hacim / ortalama", f"{X['vx']:.1f}x"); m[1].metric("1 yıl aralığı", f"{f(X['lo'])} – {f(X['hi'])}")
+            m[2].metric("60 gün zirvesinden", pc(X["from_peak"])); m[3].metric("Günlük işlem", f"${X['dollar'] / 1e6:.1f} M")
+            d_ = X["raw"].tail(120)
+            fg = go.Figure(go.Candlestick(x=d_.index, open=d_.Open, high=d_.High, low=d_.Low, close=d_.Close,
+                                          increasing_line_color="#22c58b", decreasing_line_color="#ff5d73"))
+            st.plotly_chart(layout(fg, 340), use_container_width=True, key="insp")
+            for w in X["flags"]:
+                st.warning(w, icon="⚠️")
+            if X.get("plan"):
+                p = X["plan"]
+                st.markdown(f"**Programın görüşü:** skor {X['score']:.0f} · {p['label']}")
+                k = st.columns(3)
+                k[0].metric("Kırılım seviyesi", f(p["hh"])); k[1].metric("Alış", f(p["entry"])); k[2].metric("Stop", f(p["stop"]))
+                st.caption("Program bu skoru normal hisseler için ayarladı; aşırı oynak mikro hisselerde güvenilir değildir.")
+            else:
+                st.caption("Yeterli geçmiş veri olmadığı için program bu hisse için plan üretemedi.")
+    st.divider()
+    st.subheader("📡 Ani hareket radarı")
+    st.caption("Bugün fiyatı ve hacmi birlikte sıçrayan hisseleri listeler. Bu bir alım listesi değildir: sıçrama genelde çoktan olmuştur.")
+    r1, r2 = st.columns(2)
+    mm = r1.slider("Min. günlük yükseliş (%)", 10, 200, 30)
+    vxm = r2.slider("Min. hacim katı", 2, 50, 5)
+    if st.button("📡 Radarı tara", use_container_width=True):
+        bar = st.progress(0.0, text="Nasdaq hisseleri taranıyor… (birkaç dakika sürebilir)")
+        try:
+            rows = scanner.run_radar(mm / 100, vxm, lambda x: bar.progress(min(x, 1.0), text=f"Taranıyor… %{int(x * 100)}"))
+            st.session_state["radar"] = (rows, time.strftime("%H:%M"))
+        except Exception as e:
+            st.error("Radar çalışmadı: " + str(e)[:120])
+        bar.empty()
+    RR = st.session_state.get("radar")
+    if RR:
+        rows, tm = RR
+        st.caption(f"Son tarama: {tm} · {len(rows)} hisse")
+        if rows:
+            T = pd.DataFrame(rows).rename(columns={"Gün5": "5 gün", "Hacimx": "Hacim katı", "GünlükDolar": "Günlük $"})
+            T["Fiyat"] = T["Fiyat"].map(lambda x: f"${x:,.2f}"); T["Bugün"] = T["Bugün"].map(lambda x: f"{x:+.0%}")
+            T["5 gün"] = T["5 gün"].map(lambda x: f"{x:+.0%}"); T["Hacim katı"] = T["Hacim katı"].map(lambda x: f"{x:.0f}x")
+            T["Günlük $"] = T["Günlük $"].map(lambda x: f"{x / 1e6:.1f} M")
+            st.dataframe(T[["Sembol", "Fiyat", "Bugün", "5 gün", "Hacim katı", "Günlük $", "Uyarı"]], hide_index=True, use_container_width=True)
+            st.caption("Bir sembolü yukarıdaki kutuya yazıp incelemenizi öneririm. Programın önerdiği hisseler değildir.")
+        else:
+            st.info("Bu eşiklerle hisse bulunamadı. Eşikleri düşürün.")
 
 if auto and st_autorefresh:
     st_autorefresh(interval=300_000, key="auto")

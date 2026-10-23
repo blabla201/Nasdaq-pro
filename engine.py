@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-VERSION = "v7"
+VERSION = "v10"
 
 
 # ---------- Göstergeler ----------
