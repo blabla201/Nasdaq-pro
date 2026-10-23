@@ -13,7 +13,7 @@ import engine
 import scanner
 from engine import NAMES, FUNCS, lots, session_vwap
 
-SURUM = "v6 (3 dosya)"
+SURUM = "v7 (3 dosya)"
 
 
 
@@ -22,7 +22,7 @@ st.markdown("<style>.block-container{padding-top:1.2rem}</style>", unsafe_allow_
 _ph = st.empty()
 _ph.caption("⏳ Program yükleniyor…")
 
-if getattr(scanner, "VERSION", "") != "v6" or getattr(engine, "VERSION", "") != "v6":
+if getattr(scanner, "VERSION", "") != "v7" or getattr(engine, "VERSION", "") != "v7":
     st.error("GitHub'daki engine.py veya scanner.py eski sürümde. app.py, engine.py ve scanner.py dosyalarının üçünü de yeniden yükleyin.")
     st.stop()
 
@@ -144,6 +144,12 @@ with t1:
             q = lots(capital, risk, p, frac)
             st.caption(f"Hisse başı risk {f(p['R'])} (%{p['R']/p['entry']*100:.1f}) · Lot: **{q}** · "
                        f"Maks. kayıp ≈ ${q*p['R']:,.0f} · Pozisyon büyüklüğü ≈ ${q*p['entry']:,.0f}")
+            if p["stage"] == "extended":
+                st.info(f"Kırılım gerçekleşti ama fiyat uzaklaştı. Kovalamayın: fiyatın {f(p['hh'])} seviyesine geri dönüp tutunmasını (geri test) bekleyin. Alış {f(p['entry'])} civarı.")
+            elif p["stage"] == "retest":
+                st.success("Fiyat kırılım seviyesine geri döndü ve üstünde tutunuyor: geri test bölgesi.")
+            elif p["stage"] == "fail":
+                st.error("Kırılım başarısız: fiyat seviyenin altına döndü (sahte kırılım).")
             st.caption(f"⏱ Zaman stopu: {p['max_days']} işlem günü içinde hedefe gitmezse çıkın. Stop’u aşağı çekmeyin.")
             for w in p["warn"]:
                 st.warning(w, icon="⚠️")
@@ -170,6 +176,12 @@ with t2:
                                    increasing_line_color="#22c58b", decreasing_line_color="#ff5d73"))
     fig.add_scatter(x=df.index, y=df.e9, name="EMA9", line=dict(color="#f5b942", width=1.5))
     fig.add_scatter(x=df.index, y=df.vw, name="VWAP (20g)", line=dict(color="#4d8dff", width=1.5))
+    tl = a.get("trend")
+    if tl:
+        n_ = len(a["df"]); x0 = max(tl["i1"], n_ - len(df)); x1 = n_ - 1
+        fig.add_scatter(x=[a["df"].index[x0], a["df"].index[x1]], y=[tl["y1"] + tl["m"] * (x0 - tl["i1"]), tl["y1"] + tl["m"] * (x1 - tl["i1"])],
+                        name="Düşen trend çizgisi", line=dict(color="#f5b942", dash="dash", width=1.5))
+    fig.add_hline(y=a["plan"]["hh"], line_dash="dot", line_color="#4d8dff", annotation_text="Kırılım seviyesi")
     fig.add_scatter(x=ent.index, y=ent.Low * .985, mode="markers", name="Alım", marker=dict(symbol="triangle-up", size=11, color="#22c58b"))
     fig.add_scatter(x=ext.index, y=ext.High * 1.015, mode="markers", name="Satım", marker=dict(symbol="triangle-down", size=11, color="#ff5d73"))
     st.plotly_chart(layout(fig, 430), use_container_width=True)

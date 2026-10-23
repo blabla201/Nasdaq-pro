@@ -2,9 +2,9 @@
 import io, json, os, re, time, urllib.parse, urllib.request
 import pandas as pd
 import yfinance as yf
-from engine import lots, oos, plan, prep, run_all, score
+from engine import lots, oos, plan, prep, run_all, score, trendline
 
-VERSION = "v6"
+VERSION = "v7"
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,7 +79,7 @@ def liquid(symbols, topn, minvol, pmin=5, pmax=1e9, progress=None):
 
 # ---------- Uyarılar ----------
 def sig_type(p):
-    return "kirilim" if not p["done"] else "geri" if "GERİ" in p["label"] else "alim"
+    return {"pre": "kirilim", "extended": "bekle", "retest": "geri_test"}.get(p.get("stage"), "diger")
 
 def fmt(sym, a, capital, risk, frac=False):
     p = a["plan"]
@@ -235,7 +235,7 @@ def run_scan(mode, manual, topn, minvol, cost, capital, risk, tok="", chat="", p
             bt = run_all(df, cost)
             o = oos(bt)
             sc, why = score(df, o["test_sh"])
-            A[t] = dict(df=df, bt=bt, oos=o, score=sc, why=why, plan=plan(df, sc, mkt_ok, maxatr))
+            A[t] = dict(df=df, bt=bt, oos=o, score=sc, why=why, plan=plan(df, sc, mkt_ok, maxatr), trend=trendline(df))
         except Exception:
             continue
     if use_earn:
