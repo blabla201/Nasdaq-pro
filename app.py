@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from momentum_engine import evaluate_timeframes
 
 st.set_page_config(page_title='Nasdaq Radar v5.4',page_icon='📈',layout='wide')
 st.title('📈 Nasdaq Radar v5.4 — Momentum')
@@ -26,9 +27,9 @@ def symbols_list():
     return [],'',errors
 
 @st.cache_data(ttl=120,show_spinner=False)
-def fetch_batch(tickers):
+def fetch_batch(tickers, bar_interval="5m"):
     try:
-        data=yf.download(list(tickers),period='5d',interval='5m',group_by='ticker',auto_adjust=True,progress=False,threads=True,timeout=25)
+        data=yf.download(list(tickers),period='5d',interval=bar_interval,group_by='ticker',auto_adjust=True,progress=False,threads=True,timeout=25)
     except Exception as e:return {},str(e)
     frames={}
     for t in tickers:
@@ -77,6 +78,7 @@ with st.sidebar:
     max_age=st.slider('En fazla veri yaşı (dk)',5,30,15,5)
     interval=st.select_slider('Tarama aralığı (sn)',options=[30,60,90,120],value=60)
     auto=st.toggle('Otomatik tara (uygulama açıkken)',value=True)
+    scan_mode=st.selectbox('Tarama motoru', ['Mevcut 5m', 'Deneysel 1m / 5m / 10m'])
     st.caption('Ücretsiz Yahoo verisi gecikmeli olabilir. Bu sistem gerçek zamanlı işlem sinyali değildir.')
 
 symbols,source,errors=symbols_list()
@@ -99,10 +101,18 @@ def radar():
         counts={'denenen':len(batch),'veri alınan':0,'aday':0};reasons={}
         with st.spinner('Hisseler analiz ediliyor...'):
             for j in range(0,len(batch),10):
-                frames,err=fetch_batch(tuple(batch[j:j+10]));counts['veri alınan']+=len(frames)
+                frames,err=fetch_batch(tuple(batch[j:j+10]), '1m' if scan_mode.startswith('Deneysel') else '5m');counts['veri alınan']+=len(frames)
                 for t in batch[j:j+10]:
                     if t not in frames:reasons['veri alınamadı']=reasons.get('veri alınamadı',0)+1;continue
-                    row,reason=evaluate(t,frames[t],price_low,price_high,min_turnover,max_age)
+                    if scan_mode.startswith('Deneysel'):
+                        found,reason=evaluate_timeframes(t,frames[t],price_low,price_high,min_turnover,max_age=max_age)
+                        row=max(found,key=lambda x:x['score']) if found else None
+                        if row:
+                            ts=pd.Timestamp(row['stamp']).tz_convert('UTC')
+                            row.update(age=(pd.Timestamp.now(tz='UTC')-ts).total_seconds()/60,
+                                       change5=0.0,change15=0.0)
+                    else:
+                        row,reason=evaluate(t,frames[t],price_low,price_high,min_turnover,max_age)
                     reasons[reason]=reasons.get(reason,0)+1
                     if row:st.session_state.rows54[t]=row;counts['aday']+=1
                     else:st.session_state.rows54.pop(t,None)
@@ -117,7 +127,7 @@ def radar():
     if not valid:st.warning('Şu anda doğrulanmış güncel aday yok. Veri gecikmesi ve eleme nedenlerini kontrol et.')
     for r in valid[:6]:
         with st.container(border=True):
-            st.subheader(f"{r['symbol']} — {r['state']}")
+            st.subheader(f"{r['symbol']} ({r.get('timeframe','5m')}) — {r['state']}")
             st.write(f"Fiyat **${r['price']:.3f}** · Puan **{r['score']}/100** · 5 dk **{r['change5']:+.1f}%** · RVOL **{r['rvol']:.1f}x** · Veri yaşı **{r['age']:.0f} dk**")
             a,b,c,d=st.columns(4)
             a.metric('Kırılım',f"${r['resistance']:.3f}");b.metric('Olası giriş',f"${r['entry']:.3f}")
