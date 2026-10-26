@@ -5,9 +5,10 @@ import requests
 import streamlit as st
 import yfinance as yf
 from momentum_engine import evaluate_timeframes
+from trade_engine import plan_trade, open_paper, update_paper
 
-st.set_page_config(page_title='Nasdaq Radar v5.4',page_icon='📈',layout='wide')
-st.title('📈 Nasdaq Radar v5.4 — Momentum')
+st.set_page_config(page_title='Nasdaq Radar v6.0',page_icon='📈',layout='wide')
+st.title('📈 Nasdaq Radar v6.0 — Smart Trader (Paper)')
 st.caption('5–30 dakikalık erken hareket tarayıcısı • Eğitim/araştırma amaçlı • Canlı emir veya kesin alım tavsiyesi değildir')
 
 @st.cache_data(ttl=21600)
@@ -80,6 +81,10 @@ with st.sidebar:
     auto=st.toggle('Otomatik tara (uygulama açıkken)',value=True)
     scan_mode=st.selectbox('Tarama motoru', ['Mevcut 5m', 'Deneysel 1m / 5m / 10m'])
     st.caption('Ücretsiz Yahoo verisi gecikmeli olabilir. Bu sistem gerçek zamanlı işlem sinyali değildir.')
+    st.header('🧪 Sanal işlem risk ayarı')
+    equity=st.number_input('Sanal sermaye ($)',min_value=20.0,max_value=100000.0,value=200.0,step=20.0)
+    risk_pct=st.slider('İşlem başına risk (%)',0.1,2.0,0.5,0.1)/100
+    st.caption('Gerçek emir gönderimi yoktur; yalnızca simülasyon.')
 
 symbols,source,errors=symbols_list()
 if not symbols:
@@ -87,7 +92,7 @@ if not symbols:
     if st.button('Listeyi yeniden dene'):symbols_list.clear();st.rerun()
     st.stop()
 st.caption(f'{len(symbols)} sembol • Kaynak: {source}')
-for key,default in [('cursor54',0),('rows54',{}),('scans54',0),('last54',0.),('report54',{}),('counts54',{})]:
+for key,default in [('cursor54',0),('rows54',{}),('scans54',0),('last54',0.),('report54',{}),('counts54',{}),('paper_positions',[])]:
     if key not in st.session_state:st.session_state[key]=default
 
 @st.fragment(run_every='15s')
@@ -117,6 +122,17 @@ def radar():
                     if row:st.session_state.rows54[t]=row;counts['aday']+=1
                     else:st.session_state.rows54.pop(t,None)
         st.session_state.scans54+=1;st.session_state.report54=counts;st.session_state.counts54=reasons
+        # Açık sanal işlemleri sadece yeni alınan barlarla güncelle.
+        for pos in st.session_state.paper_positions:
+            if pos.status != 'OPEN':continue
+            try:
+                pf=fetch_batch((pos.symbol,), '1m')[0].get(pos.symbol)
+                if pf is not None and len(pf):
+                    recent=pf.iloc[-1]
+                    bar_ts=pd.Timestamp(pf.index[-1]);bar_ts=bar_ts.tz_localize('UTC') if bar_ts.tzinfo is None else bar_ts.tz_convert('UTC')
+                    if bar_ts.isoformat()>pos.opened_at:
+                        update_paper(pos,float(recent['Low']),float(recent['High']),float(recent['Close']))
+            except (ValueError, KeyError, TypeError):pass
     if st.session_state.report54:
         a=st.session_state.report54;st.info(f"Son grup: {a['denenen']} denendi • {a['veri alınan']} veri alındı • {a['aday']} aday")
         with st.expander('🔬 Neden hisseler elendi?',expanded=False):st.json(st.session_state.counts54)
@@ -133,6 +149,19 @@ def radar():
             a.metric('Kırılım',f"${r['resistance']:.3f}");b.metric('Olası giriş',f"${r['entry']:.3f}")
             c.metric('Teknik stop',f"${r['stop']:.3f}");d.metric('Varsayımsal hedef',f"${r['target']:.3f}")
             st.caption(f"EMA9 ${r['ema9']:.3f} · VWAP ${r['vwap']:.3f} · Risk/ödül {r['rr']:.1f}:1. Giriş, stop ve hedef otomatik senaryodur; garanti değildir.")
+            plan, why=plan_trade(r,equity=equity,risk_pct=risk_pct)
+            if plan:
+                st.caption(f"🧪 Sanal plan: {plan['quantity']} adet · Pozisyon ${plan['notional']:.2f} · Model risk ${plan['max_model_risk']:.2f}")
+                if st.button(f"Sanal işlem aç: {r['symbol']}",key=f"paper_{r['symbol']}"):
+                    if any(p.symbol==r['symbol'] and p.status=='OPEN' for p in st.session_state.paper_positions):
+                        st.warning('Bu hissede açık sanal işlem var')
+                    else:
+                        st.session_state.paper_positions.append(open_paper(plan));st.success('Sanal işlem kaydedildi')
+            else:st.caption('Sanal işlem kapalı: '+why)
     if valid:st.download_button('📥 Adayları CSV indir',pd.DataFrame(valid).to_csv(index=False).encode('utf-8-sig'),'nasdaq_v5_4.csv','text/csv')
+    if st.session_state.paper_positions:
+        st.subheader('🧪 Sanal işlem defteri (oturumluk)')
+        st.dataframe(pd.DataFrame([vars(p) for p in st.session_state.paper_positions]),use_container_width=True)
+        st.download_button('Sanal işlemleri CSV indir',pd.DataFrame([vars(p) for p in st.session_state.paper_positions]).to_csv(index=False).encode('utf-8-sig'),'paper_trades.csv','text/csv')
     st.warning('⚠️ Bu uygulama emir vermez. Ücretsiz 5 dakikalık veriler gecikebilir; 5–30 dk işlem için broker ekranında gerçek zamanlı fiyat, spread ve hacmi doğrula. Stop emri garanti değildir.')
 radar()
